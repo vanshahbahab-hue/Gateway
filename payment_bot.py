@@ -1,17 +1,15 @@
 import re
 import json
 import os
-import asyncio
 import threading
 import qrcode
 import random
 import string
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from PIL import Image, ImageDraw, ImageFont
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ============ FLASK FOR RENDER ============
 flask_app = Flask(__name__)
@@ -74,12 +72,6 @@ completed_tx = load_completed()
 def generate_deal_id():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-def generate_pin():
-    return ''.join(random.choices(string.digits, k=6))
-
-def generate_random_paise():
-    return random.randint(1, 99)
-
 def calculate_fee(amount):
     if amount <= 400:
         return 10
@@ -92,43 +84,18 @@ def calculate_fee(amount):
 
 def get_qr_amount(original_amount):
     base_amount = original_amount + calculate_fee(original_amount)
-    random_paise = generate_random_paise()
+    random_paise = random.randint(1, 99)
     qr_amount = base_amount + (random_paise / 100)
     return round(qr_amount, 2), random_paise
 
-def generate_qr_with_bg(upi_id, qr_amount, original_amount, deal_id):
+def generate_qr(upi_id, qr_amount, deal_id):
     upi_link = f"upi://pay?pa={upi_id}&pn=ESCROW&am={qr_amount}&cu=INR&tn={deal_id}"
-    
     qr = qrcode.QRCode(version=1, box_size=10, border=2)
     qr.add_data(upi_link)
     qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white")
-    qr_pil = qr_img.get_image()
-    
-    bg = Image.new('RGB', (500, 600), color='#1a1a2e')
-    draw = ImageDraw.Draw(bg)
-    
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-    except:
-        font = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    
-    draw.text((250, 30), "ESCROW PAYMENT", fill="white", anchor="mt", font=font)
-    draw.text((250, 65), f"Deal ID: {deal_id}", fill="#aaaaaa", anchor="mt", font=font_small)
-    draw.text((250, 100), f"Amount to Pay: ₹{qr_amount}", fill="#00ff00", anchor="mt", font=font)
-    draw.text((250, 135), f"(Original Deal: ₹{original_amount})", fill="#888888", anchor="mt", font=font_small)
-    
-    qr_position = ((500 - qr_pil.size[0]) // 2, 170)
-    bg.paste(qr_pil, qr_position)
-    
-    draw.text((250, 480), "SEND SCREENSHOT AFTER PAYMENT", fill="#00ff00", anchor="mt", font=font_small)
-    draw.text((250, 510), "Auto-verify will happen when SMS is received", fill="#ffcc00", anchor="mt", font=font_small)
-    draw.text((250, 540), "DON'T PAY IN DMS", fill="red", anchor="mt", font=font_small)
-    
+    img = qr.make_image(fill_color="black", back_color="white")
     img_bytes = BytesIO()
-    bg.save(img_bytes, format='PNG')
+    img.save(img_bytes, format='PNG')
     img_bytes.seek(0)
     return img_bytes
 
@@ -137,7 +104,6 @@ def extract_amount_from_sms(text):
         r'Rs\.?\s*(\d+\.?\d*)',
         r'₹\s*(\d+\.?\d*)',
         r'debited\s*Rs\.?\s*(\d+\.?\d*)',
-        r'credited\s*Rs\.?\s*(\d+\.?\d*)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -150,7 +116,6 @@ def extract_tx_id(text):
         r'Txn ID[:\s]*(\d+)',
         r'Transaction ID[:\s]*(\d+)',
         r'TX[:\s]*(\d+)',
-        r'ID[:\s]*(\d+)',
         r'(\d{10,15})'
     ]
     for pattern in patterns:
@@ -166,23 +131,67 @@ def find_deal_by_qr_amount(qr_amount):
     return None, None
 
 # ============ ESCROW FORM PARSER ============
-async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Main message handler - handles both form creation and agreement"""
     message_text = update.message.text
     chat_id = update.effective_chat.id
+    user = update.effective_user
+    username = user.username.lower() if user.username else ""
+    text_lower = message_text.lower()
     
+    # ============ CHECK FOR AGREE FIRST ============
+    agree_words = ['agree', 'agre', 'argee', 'agr', 'yes', 'done', 'ok', 'y']
+    is_agree = any(word in text_lower for word in agree_words)
+    
+    if is_agree:
+        # Check if user is in any pending deal
+        for deal_id, deal in deals.items():
+            if deal["status"] != "pending":
+                continue
+            
+            # Check if user is buyer
+            if deal["buyer"].lower() == username:
+                deal["buyer_agreed"] = True
+                deal["buyer_id"] = user.id
+                save_deals(deals)
+                await update.message.reply_text(f"✅ @{user.username}, you agreed as BUYER for deal {deal_id}!")
+                
+                # Check if both agreed
+                if deal["seller_agreed"]:
+                    await process_both_agreed(context, deal_id, deal)
+                return
+            
+            # Check if user is seller
+            elif deal["seller"].lower() == username:
+                deal["seller_agreed"] = True
+                deal["seller_id"] = user.id
+                save_deals(deals)
+                await update.message.reply_text(f"✅ @{user.username}, you agreed as SELLER for deal {deal_id}!")
+                
+                # Check if both agreed
+                if deal["buyer_agreed"]:
+                    await process_both_agreed(context, deal_id, deal)
+                return
+        
+        # If user not in any deal
+        if is_agree:
+            await update.message.reply_text("❌ You don't have any pending deal to agree to!")
+        return
+    
+    # ============ CHECK FOR ESCROW FORM ============
     if not re.search(r'ESCROW\s*DEAL\s*FORM', message_text, re.IGNORECASE):
         return
     
+    # Parse form
     amount_match = re.search(r'DEAL\s*AMOUNT\s*:?\s*[-\s]*(\d+)', message_text, re.IGNORECASE)
     buyer_match = re.search(r'BUYERS?\s*:?\s*[-\s]*@?(\w+)', message_text, re.IGNORECASE)
     seller_match = re.search(r'SELLER\s*:?\s*[-\s]*@?(\w+)', message_text, re.IGNORECASE)
     deal_detail_match = re.search(r'DEAL\s*DETAIL\s*:?\s*[-\s]*(.+)', message_text, re.IGNORECASE)
     upi_match = re.search(r'RLS\s*UPI\s*:?\s*[-\s]*(\S+@\S+)', message_text, re.IGNORECASE)
     condition_match = re.search(r'CONDITION\s*:?\s*[-\s]*(.+)', message_text, re.IGNORECASE)
-    till_match = re.search(r'ESCROW\s*TILL\s*:?\s*[-\s]*(.+)', message_text, re.IGNORECASE)
     
     if not amount_match:
-        await update.message.reply_text("❌ Missing DEAL AMOUNT")
+        await update.message.reply_text("❌ Missing DEAL AMOUNT in form!")
         return
     
     amount = int(amount_match.group(1))
@@ -191,16 +200,14 @@ async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE)
     deal_detail = deal_detail_match.group(1) if deal_detail_match else "N/A"
     upi_id = upi_match.group(1) if upi_match else "venomxpay@naviaxis"
     condition = condition_match.group(1) if condition_match else "N/A"
-    escrow_till = till_match.group(1) if till_match else "N/A"
     
     if not buyer or not seller:
-        await update.message.reply_text("❌ Need BUYER and SELLER")
+        await update.message.reply_text("❌ Need both BUYER and SELLER in form!")
         return
     
     fee = calculate_fee(amount)
     total_with_fee = amount + fee
     qr_amount, random_paise = get_qr_amount(amount)
-    
     deal_id = generate_deal_id()
     
     deals[deal_id] = {
@@ -209,13 +216,11 @@ async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "fee": fee,
         "total_with_fee": total_with_fee,
         "qr_amount": qr_amount,
-        "random_paise": random_paise,
         "buyer": buyer,
         "seller": seller,
         "deal_detail": deal_detail,
         "upi_id": upi_id,
         "condition": condition,
-        "escrow_till": escrow_till,
         "buyer_agreed": False,
         "seller_agreed": False,
         "status": "pending",
@@ -224,8 +229,7 @@ async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "buyer_id": None,
         "seller_id": None,
         "payment_received": False,
-        "payment_txid": None,
-        "released": False
+        "payment_txid": None
     }
     save_deals(deals)
     
@@ -242,7 +246,6 @@ async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE)
 📝 Details: {deal_detail}
 💳 UPI: {upi_id}
 📋 Condition: {condition}
-⏰ Escrow Till: {escrow_till}
 
 ⚠️ ESCROW FEES IS NON-REFUNDABLE
 
@@ -258,94 +261,37 @@ async def handle_escrow_form(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id=OWNER_ID,
         text=f"🆕 NEW DEAL!\nID: {deal_id}\n₹{amount}\n@{buyer} → @{seller}"
     )
-    
-    context.job_queue.run_once(check_agreement, 600, data=deal_id)
 
-async def check_agreement(context):
-    deal_id = context.job.data
-    deal = deals.get(deal_id)
+async def process_both_agreed(context, deal_id, deal):
+    """Process when both buyer and seller have agreed"""
+    deal["status"] = "awaiting_payment"
+    save_deals(deals)
     
-    if not deal or deal["status"] != "pending":
-        return
+    qr_amount = deal["qr_amount"]
+    img_bytes = generate_qr(deal["upi_id"], qr_amount, deal_id)
+    photo = InputFile(img_bytes, filename="qr.png")
     
-    if not deal["buyer_agreed"] or not deal["seller_agreed"]:
-        await context.bot.send_message(
-            chat_id=deal["chat_id"],
-            text=f"❌ DEAL TIMEOUT!\nDeal {deal_id} cancelled."
+    # Send QR to buyer
+    if deal.get("buyer_id"):
+        await context.bot.send_photo(
+            chat_id=deal["buyer_id"],
+            photo=photo,
+            caption=f"🔷 PAYMENT QR CODE\n\nDeal ID: {deal_id}\nOriginal: ₹{deal['amount']}\nFee: ₹{deal['fee']}\n\nPay this exact amount: ₹{qr_amount}\n\nAfter payment, bot will auto-detect.\n\nDON'T PAY IN DMS"
         )
-        deal["status"] = "cancelled"
-        save_deals(deals)
-
-async def handle_agreement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    username = user.username.lower() if user.username else ""
-    text = update.message.text.lower()
     
-    agree_words = ['agree', 'agre', 'argee', 'agr', 'yes', 'done', 'ok', 'y']
-    
-    if not any(word in text for word in agree_words):
-        return
-    
-    for deal_id, deal in deals.items():
-        if deal["status"] != "pending":
-            continue
-        
-        if deal["buyer"].lower() == username:
-            deal["buyer_agreed"] = True
-            deal["buyer_id"] = user.id
-            save_deals(deals)
-            await update.message.reply_text(f"✅ @{user.username}, you agreed!")
-            
-        elif deal["seller"].lower() == username:
-            deal["seller_agreed"] = True
-            deal["seller_id"] = user.id
-            save_deals(deals)
-            await update.message.reply_text(f"✅ @{user.username}, you agreed!")
-        else:
-            continue
-        
-        if deal["buyer_agreed"] and deal["seller_agreed"]:
-            qr_amount = deal["qr_amount"]
-            
-            img_bytes = generate_qr_with_bg(deal["upi_id"], qr_amount, deal["amount"], deal_id)
-            photo = InputFile(img_bytes, filename="qr.png")
-            
-            await context.bot.send_photo(
-                chat_id=deal["buyer_id"],
-                photo=photo,
-                caption=f"🔷 PAYMENT QR CODE\n\nDeal ID: {deal_id}\nOriginal: ₹{deal['amount']}\nFee: ₹{deal['fee']}\n\nPay this exact amount: ₹{qr_amount}\n\nAfter payment, bot will auto-detect.\n\nDON'T PAY IN DMS"
-            )
-            
-            await context.bot.send_message(
-                chat_id=deal["chat_id"],
-                text=f"✅ BOTH AGREED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}\n\nBuyer @{deal['buyer']} has received QR code.\nPay EXACT ₹{qr_amount} for auto-verification!"
-            )
-            
-            deal["status"] = "awaiting_payment"
-            save_deals(deals)
-            
-            schedule_reminders(context, deal_id)
-        return
-
-def schedule_reminders(context, deal_id):
-    context.job_queue.run_once(send_reminder, 300, data=deal_id)
-    context.job_queue.run_once(send_reminder, 1800, data=deal_id)
-    context.job_queue.run_once(send_reminder, 3600, data=deal_id)
-
-async def send_reminder(context):
-    deal_id = context.job.data
-    deal = deals.get(deal_id)
-    
-    if not deal or deal["status"] != "awaiting_payment":
-        return
+    # Send confirmation to group
+    await context.bot.send_message(
+        chat_id=deal["chat_id"],
+        text=f"✅ BOTH AGREED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}\n\nBuyer @{deal['buyer']} has received QR code.\nPay EXACT ₹{qr_amount} for auto-verification!"
+    )
     
     await context.bot.send_message(
-        chat_id=deal["buyer_id"],
-        text=f"⏰ PAYMENT REMINDER!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['qr_amount']}\n\nPlease complete payment."
+        chat_id=OWNER_ID,
+        text=f"✅ BOTH AGREED!\nDeal ID: {deal_id}\n@{deal['buyer']} and @{deal['seller']}\nQR sent to buyer!"
     )
 
 # ============ SMS HANDLER ============
-async def sms_forward_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sms_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     
@@ -354,7 +300,7 @@ async def sms_forward_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     tx_id = extract_tx_id(text)
     
     if not sms_amount:
-        await update.message.reply_text(f"❌ Could not extract amount from SMS.\n\n{text[:200]}")
+        await update.message.reply_text(f"❌ Could not extract amount from SMS.")
         return
     
     deal_id, deal = find_deal_by_qr_amount(sms_amount)
@@ -397,19 +343,16 @@ async def sms_forward_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             pending_tx[tx_id] = {
                 "tx_id": tx_id,
                 "amount": sms_amount,
-                "raw_sms": text[:300],
                 "timestamp": str(datetime.now())
             }
             save_pending(pending_tx)
         
-        await update.message.reply_text(f"⚠️ Payment detected but no matching deal!\n\nAmount: ₹{sms_amount}\nTXN: {tx_id}\n\nManual verification required.")
+        await update.message.reply_text(f"⚠️ Payment detected but no matching deal!\n\nAmount: ₹{sms_amount}\nTXN: {tx_id}")
 
 # ============ COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("""
 🔷 ESCROW BOT 🔷
-
-I help secure your deals with auto-verification!
 
 Create a deal in any group:
 ESCROW DEAL FORM !!!
@@ -420,13 +363,12 @@ SELLER : @username
 DEAL DETAIL : Product
 RLS UPI : your@upi
 CONDITION : After payment
-ESCROW TILL : 2024-12-31
 
 Commands:
-/status DEAL_ID - Check deal status
+/status DEAL_ID - Check status
 /cancel DEAL_ID - Cancel deal
 
-Admin commands:
+Admin:
 /release DEAL_ID - Release funds
 /deals - List all deals
 /verify TXN DEAL - Manual verify
@@ -434,9 +376,9 @@ Admin commands:
 Developer: @iflexvenom
 """)
 
-async def release_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def release_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only.")
+        await update.message.reply_text("❌ Admin only!")
         return
     
     if len(context.args) < 1:
@@ -451,27 +393,26 @@ async def release_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if deal["status"] != "payment_confirmed":
-        await update.message.reply_text("❌ Payment not confirmed yet!")
+        await update.message.reply_text("❌ Payment not confirmed!")
         return
     
     deal["status"] = "completed"
-    deal["released"] = True
     save_deals(deals)
     
     if deal.get("seller_id"):
         await context.bot.send_message(
             chat_id=deal["seller_id"],
-            text=f"✅ DEAL RELEASED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}\nFee: ₹{deal['fee']}"
+            text=f"✅ DEAL RELEASED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}"
         )
     
     await context.bot.send_message(
         chat_id=deal["chat_id"],
-        text=f"✅ DEAL COMPLETED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}\n@{deal['buyer']} ↔ @{deal['seller']}"
+        text=f"✅ DEAL COMPLETED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}"
     )
     
     await update.message.reply_text(f"✅ Deal {deal_id} released!")
 
-async def cancel_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if len(context.args) < 1:
@@ -489,16 +430,15 @@ async def cancel_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not authorized!")
         return
     
-    if deal["status"] in ["completed", "released"]:
-        await update.message.reply_text("❌ Deal already completed!")
+    if deal["status"] in ["completed", "payment_confirmed"]:
+        await update.message.reply_text("❌ Cannot cancel now!")
         return
     
     deal["status"] = "cancelled"
     save_deals(deals)
-    
     await update.message.reply_text(f"❌ Deal {deal_id} cancelled!")
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /status DEAL_ID")
         return
@@ -524,33 +464,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ID: {deal_id}
 Status: {status_map.get(deal['status'], deal['status'])}
 Amount: ₹{deal['amount']}
-QR Amount: ₹{deal['qr_amount']}
 Buyer: @{deal['buyer']}
 Seller: @{deal['seller']}
 """)
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    active = [d for d in deals.values() if d["status"] not in ["completed", "cancelled"]]
-    completed = [d for d in deals.values() if d["status"] == "completed"]
-    total_volume = sum([d["amount"] for d in completed])
-    
-    await update.message.reply_text(f"""
-👑 ADMIN PANEL
-
-Active: {len(active)}
-Completed: {len(completed)}
-Volume: ₹{total_volume}
-
-Commands:
-/release DEAL_ID
-/deals
-/verify TXN DEAL
-""")
-
-async def list_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def deals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
@@ -565,9 +483,9 @@ async def list_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg)
 
-async def verify_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only.")
+        await update.message.reply_text("❌ Admin only!")
         return
     
     if len(context.args) < 2:
@@ -593,14 +511,8 @@ async def verify_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deal["status"] = "payment_confirmed"
     save_deals(deals)
     
-    completed_tx.append({
-        "tx_id": tx_id,
-        "amount": amount,
-        "deal_id": deal_id,
-        "verified_at": str(datetime.now())
-    })
+    completed_tx.append({"tx_id": tx_id, "amount": amount, "deal_id": deal_id})
     save_completed(completed_tx)
-    
     del pending_tx[tx_id]
     save_pending(pending_tx)
     
@@ -612,7 +524,28 @@ async def verify_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"✅ PAYMENT RECEIVED!\n\nDeal ID: {deal_id}\nAmount: ₹{deal['amount']}\n\nCONTINUE YOUR DEAL"
         )
 
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    active = [d for d in deals.values() if d["status"] not in ["completed", "cancelled"]]
+    completed = [d for d in deals.values() if d["status"] == "completed"]
+    total_volume = sum([d["amount"] for d in completed])
+    
+    await update.message.reply_text(f"""
+👑 ADMIN PANEL
+
+Active: {len(active)}
+Completed: {len(completed)}
+Volume: ₹{total_volume}
+
+Commands:
+/release DEAL_ID
+/deals
+/verify TXN DEAL
+""")
+
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     
@@ -636,24 +569,24 @@ def main():
     
     # User commands
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("cancel", cancel_deal))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
     
     # Admin commands
-    application.add_handler(CommandHandler("release", release_command))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("deals", list_deals))
-    application.add_handler(CommandHandler("verify", verify_manual))
-    application.add_handler(CommandHandler("addadmin", add_admin))
+    application.add_handler(CommandHandler("release", release_cmd))
+    application.add_handler(CommandHandler("admin", admin_cmd))
+    application.add_handler(CommandHandler("deals", deals_cmd))
+    application.add_handler(CommandHandler("verify", verify_cmd))
+    application.add_handler(CommandHandler("addadmin", addadmin_cmd))
     
-    # Message handlers
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_escrow_form))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agreement))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sms_forward_handler))
+    # Message handlers - ORDER MATTERS!
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sms_handler))
     
     print("=" * 50)
-    print("🔷 ESCROW BOT STARTED")
+    print("🔷 ESCROW BOT STARTED - FIXED VERSION")
     print(f"👑 Owner: {OWNER_ID}")
+    print(f"📋 Admins: {ADMIN_IDS}")
     print("=" * 50)
     
     application.run_polling()
